@@ -4,7 +4,7 @@ using VaxData
 
 @enum Endian LE=1 BE=2
 
-export readc3d, readparams
+export readc3d
 
 export C3DFile
 
@@ -16,25 +16,34 @@ include("validate.jl")
 struct C3DFile
     name::String
     header::Header
-    groups::Dict{Symbol,Group}
-    point::Dict{String,Array{Union{Missing, Float32},2}}
-    residuals::Dict{String, Array{Float32,1}}
-    analog::Dict{String,Array{Float32,1}}
+    groups::Dict{Symbol, Group}
+    point::Dict{String, Array{Union{Missing, Float32},2}}
+    residual::Dict{String, Array{Union{Missing, Float32},1}}
+    analog::Dict{String, Array{Float32,1}}
 end
 
 function C3DFile(name::String, header::Header, groups::Dict{Symbol,Group},
                  point::AbstractArray, residuals::AbstractArray, analog::AbstractArray;
-                 withmissings::Bool=true)
+                 missingpoints::Bool=true)
     fpoint = Dict{String,Array{Union{Missing, Float32},2}}()
-    fresiduals = Dict{String,Array{Float32,1}}()
+    fresiduals = Dict{String,Array{Union{Missing, Float32},1}}()
     fanalog = Dict{String,Array{Float32,1}}()
+
+    l = size(point, 1)
+    allpoints = 1:l
 
     if !iszero(groups[:POINT].USED)
         for (idx, symname) in enumerate(groups[:POINT].LABELS[1:groups[:POINT].USED])
             fpoint[symname] = point[:,((idx-1)*3+1):((idx-1)*3+3)]
             fresiduals[symname] = residuals[:,idx]
-            if withmissings
-                fpoint[symname][findall(x -> x == -1.0, fresiduals[symname]), :] .= missing
+            if missingpoints
+                invalidpoints = findall(x -> x === -1.0f0, fresiduals[symname])
+                calculatedpoints = findall(iszero, fresiduals[symname])
+                goodpoints = setdiff(allpoints, invalidpoints ∪ calculatedpoints)
+                fpoint[symname][invalidpoints, :] .= missing
+                fresiduals[symname][goodpoints] = calcresiduals(fresiduals[symname], abs(groups[:POINT].SCALE))[goodpoints]
+                fresiduals[symname][invalidpoints] .= missing
+                fresiduals[symname][calculatedpoints] .= 0.0f0
             end
         end
     end
@@ -61,6 +70,10 @@ function Base.show(io::IO, f::C3DFile)
               f.groups[:POINT].USED, " points, ",
               f.groups[:ANALOG].USED, " analog channels)")
     end
+end
+
+function calcresiduals(x::AbstractVector, scale)
+    residuals = (reinterpret.(UInt32, x) .>> 16) .& 0xff .* scale
 end
 
 function readdata(f::IOStream, groups::Dict{Symbol,Group}, FEND::Endian, FType::Type{T}) where T <: Union{Float32,VaxFloatF}
@@ -177,14 +190,17 @@ function saferead(io::IOStream, ::Type{VaxFloatF}, FEND::Endian, dims)::Array{Fl
 end
 
 """
-    readc3d(fn; withmissings=true)
+    readc3d(fn)
 
-Read the C3D file `fn`. Keyword argument `withmissings` replaces invalid data points with
-`missing` values.
+Read the C3D file at `fn`.
 
-See also: [`readc3dinfo`](@ref)
+# Keyword arguments
+- `paramsonly::Bool = false`: Only reads the header and parameters
+- `validateparams::Bool = true`: Validates parameters against C3D requirements
+- `missingpoints::Bool = true`: Sets invalid points to `missing`
 """
-function readc3d(fn::AbstractString; withmissings=true)
+function readc3d(fn::AbstractString; paramsonly=false, validate=true,
+                 missingpoints=true)
     if !isfile(fn)
         error("File ", fn, " cannot be found")
     end
@@ -193,11 +209,19 @@ function readc3d(fn::AbstractString; withmissings=true)
 
     groups, header, FEND, FType = _readparams(f)
 
-    validate(header, groups, complete=false)
+    if validate
+        validatec3d(header, groups, complete=false)
+    end
 
-    (point, residuals, analog) = readdata(f, groups, FEND, FType)
+    if paramsonly
+        point = Dict{String,Array{Union{Missing, Float32},2}}()
+        residual = Dict{String,Array{Union{Missing, Float32},1}}()
+        analog = Dict{String,Array{Float32,1}}()
+    else
+        (point, residual, analog) = readdata(f, groups, FEND, FType)
+    end
 
-    res = C3DFile(fn, header, groups, point, residuals, analog; withmissings=withmissings)
+    res = C3DFile(fn, header, groups, point, residual, analog; missingpoints=missingpoints)
 
     close(f)
 
@@ -216,7 +240,7 @@ function _readparams(f::IOStream)
 
     # Skip 2 reserved bytes
     # TODO: store bytes for saving modified files
-    read(f, UInt16)
+    skip(f, 2)
 
     paramblocks = read(f, UInt8)
     proctype = read(f, Int8) - 83
@@ -246,62 +270,51 @@ function _readparams(f::IOStream)
     gs = Array{Group,1}()
     ps = Array{AbstractParameter,1}()
     moreparams = true
-    lastparam = :GROUP
     fail = 0
     np = 0
 
-    read(f, UInt8)
+    skip(f, 1)
     if read(f, Int8) < 0
         # Group
         skip(f, -2)
         push!(gs, readgroup(f, FEND, FType))
+        np = gs[end].pos + gs[end].np + abs(gs[end].nl) + 2
         moreparams = gs[end].np != 0 ? true : false
-        lastparam = :GROUP
     else
         # Parameter
         skip(f, -2)
         push!(ps, readparam(f, FEND, FType))
+        np = ps[end].pos + ps[end].np + abs(ps[end].nl) + 2
         moreparams = ps[end].np != 0 ? true : false
-        lastparam = :PARAM
     end
 
     while moreparams
         # Mark current position in file in case the pointer is incorrect
         mark(f)
-        if lastparam == :GROUP
-            np = gs[end].pos + gs[end].np + abs(gs[end].nl) + 2
-            # Only seek if necessary
-            if np != position(f)
+        if fail === 0 && np != position(f)
                 @debug "Pointer mismatch at position $(position(f)) where pointer was $np"
                 seek(f, np)
-            end
-        elseif lastparam == :PARAM
-            np = ps[end].pos + ps[end].np + abs(ps[end].nl) + 2
-            if np != position(f)
-                @debug "Pointer mismatch at position $(position(f)) where pointer was $np"
-                seek(f, np)
-            end
-        elseif fail > 1 # lasparam == :NOP is a given at this point, this is the second failed attempt
+        elseif fail > 1 # this is the second failed attempt
             @debug "Second failed parameter read attempt from $(position(f))"
             break
         end
 
         # Read the next two bytes to get the gid
-        read(f, UInt8)
+        skip(f, 1)
         local gid = read(f, Int8)
         if gid < 0 # Group
             # Reset to the beginning of the group
             skip(f, -2)
             try
-              push!(gs, readgroup(f, FEND, FType))
-              moreparams = gs[end].np != 0 ? true : false # break if the pointer is 0 (ie the parameters are finished)
-              lastparam = :GROUP
+                push!(gs, readgroup(f, FEND, FType))
+                np = gs[end].pos + gs[end].np + abs(gs[end].nl) + 2
+                moreparams = gs[end].np != 0 ? true : false # break if the pointer is 0 (ie the parameters are finished)
+                fail = 0 # reset fail counter following a successful read
             catch e
                 # Last readgroup failed, possibly due to a bad pointer. Reset to the ending
-                # location of the last successfully read parameter and try again. Note the failure.
+                # location of the last successfully read parameter and try again. Count the failure.
                 reset(f)
                 @debug "Read group failed, last parameter ended at $(position(f)), pointer at $np" fail
-                lastparam = :NOP
                 fail += 1
             finally
                 unmark(f) # Unmark the file regardless
@@ -310,13 +323,13 @@ function _readparams(f::IOStream)
             # Reset to the beginning of the parameter
             skip(f, -2)
             try
-              push!(ps, readparam(f, FEND, FType))
-              moreparams = ps[end].np != 0 ? true : false
-              lastparam = :PARAM
+                push!(ps, readparam(f, FEND, FType))
+                np = ps[end].pos + ps[end].np + abs(ps[end].nl) + 2
+                moreparams = ps[end].np != 0 ? true : false
+                fail = 0
             catch e
                 reset(f)
                 @debug "Read group failed, last parameter ended at $(position(f)), pointer at $np" fail
-                lastparam = :NOP
                 fail += 1
             finally
                 unmark(f)
@@ -343,31 +356,6 @@ function _readparams(f::IOStream)
     end
 
     return (groups, header, FEND, FType)
-end
-
-"""
-    readc3dinfo(fn; validate=true)
-
-Only read the C3D file header and parameters.
-
-See also: [`readc3d`](@ref)
-"""
-function readc3dinfo(fn::AbstractString; validate=true)
-    if !isfile(fn)
-        error("File ", fn, " cannot be found")
-    end
-
-    f = open(fn, "r")
-
-    groups, header, FEND, FType = _readparams(f)
-
-    if validate
-        validate(header, groups, complete=false)
-    end
-
-    close(f)
-
-    return groups
 end
 
 end # module
